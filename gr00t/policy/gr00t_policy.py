@@ -164,6 +164,13 @@ class Gr00tPolicy(BasePolicy):
             if k != "rl_info"
         }
         self.collate_fn = self.processor.collator
+        # RTC (Real-Time Consistency): cache the previous normalized action chunk
+        # so overlapping inference windows can be stitched together across calls.
+        self._prev_normalized_action = None
+        # Relative EEF actions cannot reuse the previous normalized chunk
+        # directly under a new observation. Keep its decoded absolute trajectory
+        # so it can be re-encoded relative to the next observation first.
+        self._prev_absolute_action = None
 
         # Extract and validate language configuration
         # Some embodiments (e.g. OXE_DROID) define multiple language keys for
@@ -173,6 +180,85 @@ class Gr00tPolicy(BasePolicy):
         assert len(language_keys) >= 1, "At least one language key is required"
         assert len(language_delta_indices) == 1, "Only one language delta index is supported"
         self.language_key = language_keys[0]
+
+    def _rebase_rtc_action(
+        self,
+        previous_absolute_action: dict[str, np.ndarray],
+        states: list[dict[str, np.ndarray]],
+        template: torch.Tensor,
+        action_horizon: int,
+        overlap_steps: int,
+    ) -> torch.Tensor:
+        """Encode the previous absolute plan relative to the current observations.
+
+        The model predicts normalized relative EEF transformations. A cached
+        relative transform is tied to the state used by the previous request;
+        injecting it unchanged into a request rooted at a newer state changes
+        its absolute meaning. Decoding once and re-encoding here preserves the
+        intended base-frame trajectory across RTC calls.
+        """
+        action_keys = self.modality_configs["action"].modality_keys
+        expected_horizon = len(self.modality_configs["action"].delta_indices)
+        if action_horizon != expected_horizon:
+            raise ValueError(
+                f"RTC action_horizon={action_horizon} does not match modality "
+                f"horizon={expected_horizon}"
+            )
+        if not 0 < overlap_steps <= action_horizon:
+            raise ValueError(f"RTC overlap_steps={overlap_steps} must be in [1, {action_horizon}]")
+        source_start = action_horizon - overlap_steps
+        batch_size = template.shape[0]
+        if len(states) != batch_size:
+            raise ValueError(
+                f"RTC state batch={len(states)} does not match action batch={batch_size}"
+            )
+
+        rebased = torch.zeros_like(template)
+        processor = self.processor.state_action_processor
+        # This is an internal coordinate change, not ingestion of new dataset
+        # values. Clipping a previously generated action during re-encoding
+        # irreversibly changes the frozen RTC trajectory.
+        clip_outliers = processor.clip_outliers
+        processor.clip_outliers = False
+        try:
+            for batch_index, state in enumerate(states):
+                absolute_sample = {}
+                for key in action_keys:
+                    previous = np.asarray(previous_absolute_action[key][batch_index])
+                    # Normalization statistics are horizon-indexed (H x D).
+                    # Encode old[source_start:H] at destination indices
+                    # [0:overlap], then store those normalized destination
+                    # values back in the source slice consumed by the action
+                    # head's RTC shift.
+                    aligned = np.repeat(previous[-1:], action_horizon, axis=0)
+                    aligned[:overlap_steps] = previous[source_start:action_horizon]
+                    absolute_sample[key] = aligned
+                normalized_groups = processor.apply_action(
+                    absolute_sample,
+                    self.embodiment_tag.value,
+                    state=state,
+                )
+                normalized_sample = np.concatenate(
+                    [normalized_groups[key] for key in action_keys], axis=-1
+                )
+                if normalized_sample.shape[0] != action_horizon:
+                    raise ValueError(
+                        f"RTC cached horizon={normalized_sample.shape[0]} does not match "
+                        f"action_horizon={action_horizon}"
+                    )
+                if normalized_sample.shape[1] > template.shape[2]:
+                    raise ValueError(
+                        f"RTC action dim={normalized_sample.shape[1]} exceeds model dim="
+                        f"{template.shape[2]}"
+                    )
+                rebased[
+                    batch_index,
+                    source_start:action_horizon,
+                    : normalized_sample.shape[1],
+                ] = torch.as_tensor(normalized_sample[:overlap_steps], dtype=template.dtype)
+        finally:
+            processor.clip_outliers = clip_outliers
+        return rebased
 
     def _unbatch_observation(self, value: dict[str, Any]) -> list[dict[str, Any]]:
         """Unbatch a batched observation into a list of single observations.
@@ -391,7 +477,8 @@ class Gr00tPolicy(BasePolicy):
 
         Args:
             observation: Batched observation dictionary
-            options: Optional parameters (currently unused)
+            options: Optional parameters for inference (e.g. RTC configuration with
+                keys: rtc_overlap_steps, rtc_frozen_steps, rtc_ramp_rate, action_horizon)
 
         Returns:
             Tuple of (actions_dict, info_dict)
@@ -412,10 +499,44 @@ class Gr00tPolicy(BasePolicy):
         collated_inputs = self.collate_fn(processed_inputs)
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
 
-        # Step 4: Run model inference to predict actions
+        # Step 3.5: collator wraps the batch in a single "inputs" dict (tokens, state,
+        # embodiment_id); RTC injects the previous chunk there so the action head sees it.
+        rtc_rebased = False
+        rtc_expected_frozen = None
+        if options is not None and self._prev_absolute_action is not None:
+            if self._prev_normalized_action is None:
+                raise RuntimeError("RTC absolute action cache exists without a tensor template")
+            rebased_action = self._rebase_rtc_action(
+                self._prev_absolute_action,
+                states,
+                self._prev_normalized_action,
+                int(options["action_horizon"]),
+                int(options["rtc_overlap_steps"]),
+            )
+            collated_inputs["inputs"]["action"] = rebased_action
+            source_start = int(options["action_horizon"]) - int(options["rtc_overlap_steps"])
+            frozen_steps = int(options["rtc_frozen_steps"])
+            rtc_expected_frozen = rebased_action[
+                :, source_start : source_start + frozen_steps, :
+            ].clone()
+            rtc_rebased = True
+
+        # Step 4: pass the inner "inputs" dict; get_action(**collated_inputs) unpacked it,
+        # but passing the wrapper would leave the backbone without input_ids.
         with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+            model_pred = self.model.get_action(collated_inputs["inputs"], options=options)
         normalized_action = model_pred["action_pred"].float()
+        rtc_frozen_normalized_max_error = None
+        if rtc_expected_frozen is not None:
+            frozen_steps = rtc_expected_frozen.shape[1]
+            rtc_frozen_normalized_max_error = float(
+                torch.max(
+                    torch.abs(
+                        normalized_action[:, :frozen_steps, :]
+                        - rtc_expected_frozen.to(normalized_action.device)
+                    )
+                ).item()
+            )
 
         # Step 5: Decode actions from normalized space back to physical units
         batched_states = {}
@@ -429,7 +550,16 @@ class Gr00tPolicy(BasePolicy):
         casted_action = {
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
-        return casted_action, {}
+        # Store both representations only after decoding succeeds. The absolute
+        # copy is the coordinate-invariant RTC cache; the normalized tensor is
+        # retained solely as the padded shape/dtype template expected by the
+        # action head.
+        self._prev_normalized_action = normalized_action.detach().cpu()
+        self._prev_absolute_action = {key: value.copy() for key, value in casted_action.items()}
+        return casted_action, {
+            "rtc_rebased": rtc_rebased,
+            "rtc_frozen_normalized_max_error": rtc_frozen_normalized_max_error,
+        }
 
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.
@@ -488,6 +618,11 @@ class Gr00tPolicy(BasePolicy):
         Returns:
             Dictionary containing the info after resetting the policy
         """
+        # RTC stitches consecutive inference windows using the previous
+        # normalized action chunk. A new episode/task must never inherit the
+        # chunk cached by an earlier bridge or benchmark client.
+        self._prev_normalized_action = None
+        self._prev_absolute_action = None
         return {}
 
 

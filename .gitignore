@@ -168,3 +168,16 @@ offline_open_loop_eval_plots/
 # Generic model/data folders
 /models
 /data
+
+# Local model checkpoints and training state
+checkpoints/
+checkpoint-*/
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+
+# Local Seer evaluation output and source backups
+/seer_robot_gr00t_finetune/inference_results/
+*.pre_rtc_*
+*.bak_*

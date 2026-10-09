@@ -41,6 +41,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy.spatial.transform import Rotation
 
 from gr00t.data.types import ModalityConfig
 from gr00t.utils.initial_actions import INITIAL_ACTIONS_FILENAME, load_initial_actions
@@ -333,7 +334,14 @@ class LeRobotEpisodeLoader:
                 original_key = group_info.get("original_key", DEFAULT_COLUMN_NAMES[modality_type])
                 # Slice the array data for this joint group
                 if isinstance(df[original_key].iloc[0], np.ndarray):
-                    joint_data[group_name] = df[original_key].map(lambda x: x[start_idx:end_idx])
+                    values = df[original_key].map(lambda x: x[start_idx:end_idx])
+                    # SEER v2.1 stores EEF poses as xyz+quaternion (xyzw).
+                    # Expose the canonical GR00T representation xyz+rotvec.
+                    if end_idx - start_idx == 7 and (
+                        group_name.endswith("_ee_pose") or group_name.endswith("_ee_pose_target")
+                    ):
+                        values = values.map(self._quat_pose_to_rotvec)
+                    joint_data[group_name] = values
                 else:
                     joint_data[group_name] = df[original_key]  # for strings and scalars
             else:
@@ -342,6 +350,36 @@ class LeRobotEpisodeLoader:
                 )
 
         return joint_data
+
+    @staticmethod
+    def _quat_pose_to_rotvec(value: np.ndarray) -> np.ndarray:
+        value = np.asarray(value, dtype=np.float32)
+        quat = value[3:7]
+        quat = quat / max(float(np.linalg.norm(quat)), 1e-12)
+        return np.concatenate([value[:3], Rotation.from_quat(quat).as_rotvec()]).astype(np.float32)
+
+    def _transformed_stats(
+        self, modality: str, key: str, original_key: str, start: int, end: int
+    ) -> dict:
+        """Compute exact stats for a quaternion EEF group after loader conversion."""
+        values = []
+        for episode_index in range(len(self.episodes_metadata)):
+            chunk_idx = episode_index // self.chunk_size
+            path = self.dataset_path / self.data_path_pattern.format(
+                episode_chunk=chunk_idx, episode_index=episode_index
+            )
+            col = pd.read_parquet(path, columns=[original_key])[original_key]
+            for item in col:
+                values.append(self._quat_pose_to_rotvec(np.asarray(item)[start:end]))
+        arr = np.asarray(values, dtype=np.float64)
+        return {
+            "min": np.min(arr, axis=0).tolist(),
+            "max": np.max(arr, axis=0).tolist(),
+            "q01": np.quantile(arr, 0.01, axis=0).tolist(),
+            "q99": np.quantile(arr, 0.99, axis=0).tolist(),
+            "mean": np.mean(arr, axis=0).tolist(),
+            "std": np.std(arr, axis=0).tolist(),
+        }
 
     def _load_parquet_data(self, episode_index: int) -> pd.DataFrame:
         """
@@ -524,10 +562,19 @@ class LeRobotEpisodeLoader:
                     self.modality_meta[modality][joint_key]["start"],
                     self.modality_meta[modality][joint_key]["end"],
                 )
-                for stat_type in self.stats[stats_key].keys():  # mean, std, min, max, q01, q99
-                    dataset_statistics[modality][joint_key][stat_type] = self.stats[stats_key][
-                        stat_type
-                    ][start_idx:end_idx]
+                if end_idx - start_idx == 7 and (
+                    joint_key.endswith("_ee_pose") or joint_key.endswith("_ee_pose_target")
+                ):
+                    transformed = self._transformed_stats(
+                        modality, joint_key, stats_key, start_idx, end_idx
+                    )
+                    for stat_type, values in transformed.items():
+                        dataset_statistics[modality][joint_key][stat_type] = values
+                else:
+                    for stat_type in self.stats[stats_key].keys():  # mean, std, min, max, q01, q99
+                        dataset_statistics[modality][joint_key][stat_type] = self.stats[stats_key][
+                            stat_type
+                        ][start_idx:end_idx]
         stats = _to_plain_dict(dataset_statistics)
         # Directly add relative action stats
         if "relative_action" in self.stats:

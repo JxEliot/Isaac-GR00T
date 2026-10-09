@@ -694,6 +694,11 @@ class EndEffectorPose(Pose):
         if action_format == ActionFormat.XYZ_ROT6D:
             return cls(translation=data[:3], rotation=data[3:], rotation_type="rot6d")
         elif action_format == ActionFormat.XYZ_ROTVEC:
+            if data.shape[-1] != 6:
+                raise ValueError(
+                    f"XYZ_ROTVEC expects 6 values (xyz+rotvec), got shape {data.shape}. "
+                    "Convert quaternion poses in the LeRobot loader first."
+                )
             return cls(translation=data[:3], rotation=data[3:], rotation_type="rotvec")
         elif action_format == ActionFormat.DEFAULT:
             return cls(homogeneous=data.reshape(4, 4))

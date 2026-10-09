@@ -97,7 +97,10 @@ if __name__ == "__main__":
 
     config.model.load_bf16 = False
     config.model.reproject_vision = False
-    config.model.model_name = "nvidia/Cosmos-Reason2-2B"
+    config.model.model_name = os.environ.get(
+        "GR00T_BACKBONE_MODEL",
+        "/mnt/cfs/usr/jixiang/hf_models/Cosmos-Reason2-2B",
+    )
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True
 

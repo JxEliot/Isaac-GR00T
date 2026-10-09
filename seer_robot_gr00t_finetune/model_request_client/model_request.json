@@ -1,0 +1,15 @@
+{
+    "backend": "pi05",
+    "collection_config": "../../data_collection/config/data_collection.json",
+    "task": "Pick up the part and place it into the box.",
+    "request_hz": 5.0,
+    "request_topic": "/ModelInference/Request",
+    "response_topic": "/ModelInference/Action",
+    "dry_run": true,
+    "publish_action": false,
+    "image_quality": 75,
+    "backends": {
+        "pi05": {"url": "http://127.0.0.1:18080/v1/pi05/action", "timeout_ms": 500},
+        "gr00t": {"url": "http://127.0.0.1:18081/v1/gr00t/action", "timeout_ms": 500},
+    },
+}

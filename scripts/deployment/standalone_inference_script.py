@@ -16,6 +16,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field
+import json
 import logging
 import os
 from pathlib import Path
@@ -393,7 +394,11 @@ def run_single_trajectory(
     timing_dict["episode_load_time"] = time.time() - episode_load_start
 
     traj_length = len(traj)
-    actual_steps = min(steps, traj_length)
+    if steps < 0 or execution_horizon <= 0:
+        raise ValueError("steps must be >= 0 and execution_horizon must be > 0")
+    actual_steps = traj_length if steps == 0 else min(steps, traj_length)
+    if actual_steps == 0:
+        raise ValueError(f"Trajectory {traj_id} is empty")
     logging.info(
         f"Using {actual_steps} steps (requested: {steps}, trajectory length: {traj_length})"
     )
@@ -464,7 +469,7 @@ def run_single_trajectory(
 
         # Action processing
         action_chunk = parse_action_gr00t(_action_chunk)
-        for j in range(execution_horizon):
+        for j in range(min(execution_horizon, actual_steps - step_count)):
             # NOTE: concat_pred_action = action[f"action.{modality_keys[0]}"][j]
             # the np.atleast_1d is to ensure the action is a 1D array, handle where single value is returned
             concat_pred_action = np.concatenate(
@@ -575,7 +580,7 @@ class ArgsConfig:
     """Port to connect to."""
 
     steps: int = 200
-    """Maximum number of steps to evaluate (will be capped by trajectory length)."""
+    """Maximum steps to evaluate; 0 evaluates the complete episode."""
 
     traj_ids: list[int] = field(default_factory=lambda: [0])
     """List of trajectory IDs to evaluate."""
@@ -602,6 +607,9 @@ class ArgsConfig:
     save_plot_path: str | None = None
     """Path to save the plot to."""
 
+    save_results_dir: str | None = None
+    """Directory for per-episode prediction NPZ files and summary JSON."""
+
     skip_timing_steps: int = 1
     """Number of initial inference steps to skip when calculating timing statistics (default: 1 to exclude warmup)."""
 
@@ -613,6 +621,8 @@ class ArgsConfig:
 
 
 def main(args: ArgsConfig):
+    if args.steps < 0 or args.execution_horizon <= 0:
+        raise ValueError("steps must be >= 0 and execution_horizon must be > 0")
     # Set up logging
     logging.basicConfig(level=logging.INFO)
     logging.info("\n" + "=" * 80)
@@ -735,6 +745,16 @@ def main(args: ArgsConfig):
     all_timings = []
     pred_actions = []
     obs = None
+    episode_results = []
+    results_dir = Path(args.save_results_dir) if args.save_results_dir else None
+    if results_dir is not None:
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+    invalid_ids = [i for i in args.traj_ids if i < 0 or i >= len(dataset)]
+    if invalid_ids:
+        raise ValueError(
+            f"Invalid trajectory IDs {invalid_ids}; dataset has {len(dataset)} episodes"
+        )
 
     for traj_id in args.traj_ids:
         if traj_id < 0 or traj_id >= len(dataset):
@@ -744,6 +764,8 @@ def main(args: ArgsConfig):
             continue
 
         logging.info(f"Running trajectory: {traj_id}")
+        if hasattr(policy, "reset"):
+            policy.reset()
         (
             state_keys,
             action_keys,
@@ -763,6 +785,34 @@ def main(args: ArgsConfig):
         )
         pred_actions.append(pred_action_across_time)
 
+        episode_result = {
+            "episode_id": traj_id,
+            "steps": actual_steps,
+            "episode_length": len(traj),
+            "timing": timing_dict,
+        }
+        if results_dir is not None:
+            result_path = results_dir / f"episode_{traj_id:06d}.npz"
+            gt_actions = np.concatenate(
+                [np.vstack(traj[f"action.{key}"].to_numpy()) for key in action_keys],
+                axis=-1,
+            )[:actual_steps]
+            np.savez_compressed(
+                result_path,
+                pred_action=pred_action_across_time,
+                gt_action=gt_actions,
+                action_keys=np.asarray(action_keys),
+                episode_id=traj_id,
+                execution_horizon=args.execution_horizon,
+            )
+            episode_result["prediction_path"] = str(result_path)
+            logging.info(f"Saved episode predictions: {result_path}")
+
+        plot_path = args.save_plot_path
+        if plot_path and len(args.traj_ids) > 1:
+            path = Path(plot_path)
+            plot_path = str(path.with_name(f"{path.stem}_episode_{traj_id:06d}{path.suffix}"))
+
         if args.get_performance_stats:
             mse, mae = evaluate_predictions(
                 state_keys,
@@ -772,13 +822,28 @@ def main(args: ArgsConfig):
                 traj_id,
                 actual_steps,
                 args.execution_horizon,
-                save_plot_path=args.save_plot_path,
+                save_plot_path=plot_path,
             )
 
             logging.info(f"MSE for trajectory {traj_id}: {mse}, MAE: {mae}")
             all_mse.append(mse)
             all_mae.append(mae)
             all_timings.append(timing_dict)
+            episode_result.update(mse=float(mse), mae=float(mae), plot_path=plot_path)
+
+        episode_results.append(episode_result)
+        if results_dir is not None:
+            with (results_dir / "summary.json").open("w") as result_file:
+                json.dump(
+                    {
+                        "model_path": args.model_path,
+                        "dataset_path": args.dataset_path,
+                        "requested_episodes": args.traj_ids,
+                        "episodes": episode_results,
+                    },
+                    result_file,
+                    indent=2,
+                )
 
     if args.get_performance_stats:
         # Final performance summary
